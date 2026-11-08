@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Viseur</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;color:#fff;
+    -webkit-user-select:none;user-select:none;touch-action:none;-webkit-tap-highlight-color:transparent}
+  video{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;transform-origin:50% 50%}
+  canvas{position:fixed;inset:0;width:100%;height:100%}
+  #start{position:fixed;inset:0;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;z-index:10}
+  #start h1{margin:0;font-size:28px;letter-spacing:4px}
+  #start p{margin:0;max-width:320px;color:#9aa;font-size:14px;line-height:1.5}
+  button{font:inherit;color:#fff;background:#1b1b1bcc;border:1px solid #ffffff44;border-radius:10px;padding:10px 16px}
+  #go{background:#c0392b;border:0;font-size:18px;padding:14px 32px;letter-spacing:2px}
+  #ui{position:fixed;left:0;right:0;bottom:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));display:none;z-index:5;
+    background:linear-gradient(transparent,#000a)}
+  #ui .row{display:flex;gap:10px;align-items:center;margin-top:8px}
+  #ui label{font-size:12px;color:#cdd;min-width:70px}
+  input[type=range]{flex:1;accent-color:#e74c3c}
+  #msg{position:fixed;top:calc(10px + env(safe-area-inset-top));left:0;right:0;text-align:center;font-size:13px;color:#ffb4a8;z-index:5;padding:0 16px}
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="cv"></canvas>
+<div id="msg"></div>
+
+<div id="ui">
+  <div class="row"><label>Zoom <span id="zv">2.0x</span></label><input id="zoom" type="range" min="1" max="8" step="0.1" value="2"></div>
+  <div class="row"><label>FOV <span id="fv">60°</span></label><input id="fov" type="range" min="35" max="90" step="1" value="60"></div>
+  <div class="row"><button id="clear" style="flex:1">Effacer la cible</button></div>
+</div>
+
+<div id="start">
+  <h1>VISEUR</h1>
+  <p>Touche l'écran pour poser un point sur un endroit réel. Ensuite il reste collé à cet endroit même quand tu bouges le téléphone : aligne le réticule dessus pour verrouiller.</p>
+  <button id="go">DÉMARRER</button>
+  <p style="font-size:12px">Autorise la caméra et les capteurs de mouvement. Page en HTTPS requise.</p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('cam'), cv = $('cv'), ctx = cv.getContext('2d');
+let W, H, dpr;
+function resize(){
+  dpr = window.devicePixelRatio || 1; W = innerWidth; H = innerHeight;
+  cv.width = W*dpr; cv.height = H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener('resize', resize); resize();
+
+// ---------- état ----------
+let ang = {a:0,b:0,g:0}, hasSensor = false;
+let zoom = 2, vfov = 60;      // zoom numérique, champ de vision vertical (calibrage)
+let target = null;            // direction monde (vecteur unitaire)
+let locked = false;
+
+const rad = Math.PI/180;
+const orient = () => ((screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0) * rad;
+
+// matrice de rotation appareil -> monde (spec W3C, ordre Z-X'-Y'')
+function rotMatrix(){
+  const a=ang.a*rad, b=ang.b*rad, g=ang.g*rad;
+  const cA=Math.cos(a), sA=Math.sin(a), cB=Math.cos(b), sB=Math.sin(b), cG=Math.cos(g), sG=Math.sin(g);
+  return [
+    [cA*cG - sA*sB*sG, -cB*sA, cG*sA*sB + cA*sG],
+    [cG*sA + cA*sB*sG,  cA*cB, sA*sG - cA*cG*sB],
+    [-cB*sG,            sB,    cB*cG]
+  ];
+}
+const mul  = (R,v)=>[R[0][0]*v[0]+R[0][1]*v[1]+R[0][2]*v[2], R[1][0]*v[0]+R[1][1]*v[1]+R[1][2]*v[2], R[2][0]*v[0]+R[2][1]*v[1]+R[2][2]*v[2]];
+const mulT = (R,v)=>[R[0][0]*v[0]+R[1][0]*v[1]+R[2][0]*v[2], R[0][1]*v[0]+R[1][1]*v[1]+R[2][1]*v[2], R[0][2]*v[0]+R[1][2]*v[1]+R[2][2]*v[2]];
+const rotZ = (v,t)=>[v[0]*Math.cos(t)-v[1]*Math.sin(t), v[0]*Math.sin(t)+v[1]*Math.cos(t), v[2]];
+const norm = v=>{const l=Math.hypot(...v);return [v[0]/l,v[1]/l,v[2]/l]};
+const focal = () => (H/2) / Math.tan(vfov*rad/2) * zoom;   // en pixels
+
+// pixel écran -> direction monde
+function pixelToWorld(px,py){
+  const F = focal();
+  const d = [(px-W/2)/F, -(py-H/2)/F, -1];   // la caméra arrière regarde vers -Z
+  return norm(mul(rotMatrix(), rotZ(d, -orient())));
+}
+// direction monde -> repère écran (x droite, y haut, z vers nous)
+function worldToScreenFrame(w){ return rotZ(mulT(rotMatrix(), w), orient()); }
+
+// ---------- capteurs & caméra ----------
+addEventListener('deviceorientation', e=>{
+  if(e.alpha==null) return;
+  ang.a=e.alpha; ang.b=e.beta; ang.g=e.gamma; hasSensor=true;
+});
+
+$('go').onclick = async ()=>{
+  try{
+    if(typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function'){
+      const r = await DeviceOrientationEvent.requestPermission();
+      if(r!=='granted') throw new Error('Capteurs refusés');
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080}}, audio:false});
+    video.srcObject = stream; await video.play();
+    try{ await navigator.wakeLock.request('screen'); }catch(_){}
+    try{ await screen.orientation.lock('portrait'); }catch(_){}
+    $('start').style.display='none'; $('ui').style.display='block';
+    setTimeout(()=>{ if(!hasSensor) $('msg').textContent='Aucun capteur de mouvement détecté : la cible ne pourra pas rester fixe.'; }, 1500);
+  }catch(err){
+    $('msg').textContent = 'Erreur : ' + err.message + ' (HTTPS requis, autorise caméra et capteurs)';
+  }
+};
+
+// ---------- interactions ----------
+cv.addEventListener('pointerdown', e=>{
+  if(!hasSensor) return;
+  target = pixelToWorld(e.clientX, e.clientY);
+  locked = false;
+  if(navigator.vibrate) navigator.vibrate(15);
+});
+$('clear').onclick = ()=>{ target=null; locked=false; };
+$('zoom').oninput = e=>{ zoom=+e.target.value; $('zv').textContent=zoom.toFixed(1)+'x'; video.style.transform=`scale(${zoom})`; };
+$('fov').oninput  = e=>{ vfov=+e.target.value; $('fv').textContent=vfov+'°'; };
+video.style.transform = `scale(${zoom})`;
+
+// ---------- dessin ----------
+function drawTarget(x,y,ok){
+  const c = ok ? '#2ecc71' : '#ff9f1a', s = 22, t = performance.now()/1000;
+  ctx.save(); ctx.translate(x,y); ctx.strokeStyle=c; ctx.lineWidth=2.5; ctx.shadowColor='#000'; ctx.shadowBlur=4;
+  ctx.rotate(ok?0:t*0.8);
+  ctx.beginPath(); ctx.arc(0,0,s,0,Math.PI*2); ctx.stroke();
+  ctx.rotate(-(ok?0:t*0.8));
+  for(let i=0;i<4;i++){ ctx.rotate(Math.PI/2); ctx.beginPath(); ctx.moveTo(s+4,0); ctx.lineTo(s+16,0); ctx.stroke(); }
+  ctx.fillStyle=c; ctx.beginPath(); ctx.arc(0,0,3,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawReticle(R, ok){
+  const cx=W/2, cy=H/2, col = ok ? '#2ecc71' : '#ff3b30';
+  ctx.save(); ctx.translate(cx,cy); ctx.strokeStyle=col; ctx.fillStyle=col; ctx.shadowColor='#000'; ctx.shadowBlur=3;
+  const gap=R*0.05, mid=R*0.38;
+  for(let i=0;i<4;i++){
+    ctx.rotate(Math.PI/2);
+    ctx.lineWidth=1.2; ctx.beginPath(); ctx.moveTo(gap,0); ctx.lineTo(mid,0); ctx.stroke();       // trait fin
+    ctx.lineWidth=4;   ctx.beginPath(); ctx.moveTo(mid,0); ctx.lineTo(R,0); ctx.stroke();         // trait épais
+    for(let k=1;k<=5;k++){ ctx.beginPath(); ctx.arc(gap+k*(mid-gap)/6,0,1.6,0,Math.PI*2); ctx.fill(); } // mil-dots
+  }
+  ctx.beginPath(); ctx.arc(0,0,1.8,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function loop(){
+  ctx.clearRect(0,0,W,H);
+  const R = Math.min(W,H)*0.47, cx=W/2, cy=H/2;
+  let info = hasSensor ? 'Touche l’écran pour poser une cible' : '';
+  let arrow = null, ok = false;
+
+  if(target && hasSensor){
+    const d = worldToScreenFrame(target), F = focal();
+    const forward = norm(mul(rotMatrix(), rotZ([0,0,-1], -orient())));
+    const dot = Math.max(-1, Math.min(1, forward[0]*target[0]+forward[1]*target[1]+forward[2]*target[2]));
+    const deg = Math.acos(dot)/rad;
+    if(d[2] < -1e-3){
+      const sx = cx + F*d[0]/(-d[2]), sy = cy - F*d[1]/(-d[2]);
+      const dist = Math.hypot(sx-cx, sy-cy);
+      ok = dist < 14;
+      if(ok && !locked && navigator.vibrate) navigator.vibrate([30,40,30]);
+      locked = ok;
+      if(dist < R) drawTarget(sx, sy, ok);
+      else arrow = Math.atan2(sy-cy, sx-cx);
+    } else arrow = Math.atan2(-d[1], d[0]) * 1 && Math.atan2(-d[1], d[0]);
+    info = ok ? 'CIBLE VERROUILLÉE' : `Écart : ${deg.toFixed(1)}°`;
+  }
+
+  // masque de lunette
+  ctx.fillStyle='rgba(0,0,0,.93)'; ctx.beginPath(); ctx.rect(0,0,W,H); ctx.arc(cx,cy,R,0,Math.PI*2); ctx.fill('evenodd');
+  ctx.strokeStyle='#000'; ctx.lineWidth=10; ctx.beginPath(); ctx.arc(cx,cy,R,0,Math.PI*2); ctx.stroke();
+  ctx.strokeStyle='#ffffff22'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.arc(cx,cy,R-6,0,Math.PI*2); ctx.stroke();
+
+  drawReticle(R, ok);
+
+  if(arrow!==null){            // flèche vers la cible hors champ
+    ctx.save(); ctx.translate(cx,cy); ctx.rotate(arrow); ctx.translate(R-30,0);
+    ctx.fillStyle='#ff9f1a'; ctx.beginPath(); ctx.moveTo(18,0); ctx.lineTo(-10,-14); ctx.lineTo(-10,14); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.font='600 14px system-ui'; ctx.textAlign='center'; ctx.fillStyle = ok ? '#2ecc71' : '#fff';
+  ctx.shadowColor='#000'; ctx.shadowBlur=4;
+  ctx.fillText(info, cx, cy + R + 28);
+  ctx.shadowBlur=0;
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
